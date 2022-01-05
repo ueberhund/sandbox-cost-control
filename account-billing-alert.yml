@@ -1,0 +1,40 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: This template allows an organization to to set a budget alert on an account. When that alert is met, an SCP is applied that denies all access except to an admin user you specify
+
+# Turn on billing alerts by going to the Billing Dashboard -> Billing Preferences -> check Receive Billing Alerts. This checkbox enables CW billing metrics, which enable CW billing alarms
+
+Parameters:
+  DefaultBudgetAmount:
+    Type: String
+    Description: The amount to use for a budget threshold
+    
+  AccountToMonitor:
+    Type: String
+    Description: The account to monitor
+    
+  SNSTopic:
+    Type: String
+    Description: The SNS topic to publish to when the alarm is in an IN_ALARM state
+    
+Resources:
+  AccountBillingAlert:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub "CloudWatch Billing alarm on account # ${AccountToMonitor}"
+      AlarmActions:
+        - !Ref SNSTopic
+      OKActions:
+        - !Ref SNSTopic
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Statistic: Maximum 
+      Threshold: !Ref DefaultBudgetAmount
+      Period: 21600
+      Dimensions:
+        - Name: LinkedAccount
+          Value: !Ref AccountToMonitor
+        - Name: Currency
+          Value: USD

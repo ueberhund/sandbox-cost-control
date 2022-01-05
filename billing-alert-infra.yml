@@ -1,0 +1,306 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: This template allows an organization to to set a budget alert on an account. When that alert is met, an SCP is applied that denies all access except to an admin user you specify
+
+# Turn on billing alerts by going to the Billing Dashboard -> Billing Preferences -> check Receive Billing Alerts. This checkbox enables CW billing metrics, which enable CW billing alarms
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: The email address to send alerts and notifications to
+    AllowedPattern: '[^\s@]+@[^\s@]+\.[^\s@]+'
+    ConstraintDescription: You should enter a valid email address
+    
+  AdminUserArn:
+    Type: String
+    Description: The arn of the user or role who should continue to have access to the account after the budget threshold is met
+    
+Resources:  
+  BudgetSNSTopic:
+    Type: AWS::SNS::Topic
+     
+  BudgetEmailSubscription:
+    Type: AWS::SNS::Subscription 
+    Properties:
+      Endpoint: !Ref AlertEmail 
+      Protocol: email 
+      TopicArn: !Ref BudgetSNSTopic
+      
+  CWAlarmSNSTopic:
+    Type: AWS::SNS::Topic 
+  
+  BudgetLambdaSubscription:
+    Type: AWS::SNS::Subscription 
+    Properties:
+      Endpoint: !GetAtt LambdaBudgetAction.Arn
+      Protocol: lambda
+      TopicArn: !Ref CWAlarmSNSTopic
+      
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaBudgetAction
+      Action: "lambda:InvokeFunction"
+      Principal: "sns.amazonaws.com"
+      SourceArn: !Ref CWAlarmSNSTopic
+      
+  SCPPolicy:
+    Type: Custom::ServiceControlPolicy
+    Properties:
+      PolicyName: QuarantineSCP
+      PolicyDescription: This SCP prevents/restricts all IAM permissions in an account.
+      ServiceToken: !GetAtt SCPPolicyLambdaFunc.Arn
+
+  SCPPolicyLambdaFunc:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-Quarantine
+      Code:
+        ZipFile:
+         !Sub |
+            import boto3
+            import cfnresponse as cfn
+            import logging
+
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+
+            client = boto3.client('organizations')
+
+            def lambda_handler(event, context):
+              try:
+                  logger.info('REQUEST: {}'.format(event))
+                  logger.info('REQUEST: {}'.format(context))
+                  
+                  resource_action = event['RequestType']
+                  policy_name = event['ResourceProperties']['PolicyName']
+                  policy_contents = create_policy_contents()
+                  policy_description = event['ResourceProperties']['PolicyDescription']
+                  
+                  if resource_action == 'Create':
+                      logger.info('ACTION: {} policy'.format(resource_action))
+                      response = client.create_policy(
+                          Content=policy_contents,
+                          Description=policy_description,
+                          Name=policy_name,
+                          Type='SERVICE_CONTROL_POLICY'
+                      )
+                      logger.info('RESPONSE: {}'.format(response))
+                      policyId = response['Policy']['PolicySummary']['Id']
+                      
+                      cfn.send(event, context, cfn.SUCCESS, {'PolicyId': policyId}, 'CustomResourcePhysicalID')
+                  elif resource_action == 'Update' or resource_action == 'Delete':
+                      logger.info('ACTION: {} policy'.format(resource_action))
+                      response, policyId = update_policies(policy_name, resource_action, policy_contents)
+                      logger.info('RESPONSE: {}'.format(response))
+                      
+                      cfn.send(event, context, cfn.SUCCESS, {'MessPolicyIdage': policyId}, 'CustomResourcePhysicalID')
+              
+              except Exception as exc:
+                  logger.info('FAILED: {}'.format(exc))
+                  cfn.send(event, context, cfn.FAILED,
+                          {'PolicyId': ''}, 'CustomResourcePhysicalID')
+            
+            def create_policy_contents():
+              iam_arns = "${AdminUserArn}".split(",")
+              policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Action\":\"*\",\"Resource\":\"*\",\"Condition\":{\"StringNotLike\":{\"aws:PrincipalArn\":["
+              
+              counter = 0
+              for arn in iam_arns:
+                if counter != 0:
+                  policy += ","
+                policy +=  "\"{}\"".format(arn)
+                counter += 1
+              policy += "]}}}]}"
+              
+              return policy
+              
+            def update_policies(policy_name, resource_action, policy_contents):
+                response = client.list_policies(Filter='SERVICE_CONTROL_POLICY')
+                policy = list(filter(lambda item: item['Name'] == policy_name, response["Policies"]))
+                logger.info('POLICY FOUND: {}'.format(policy))
+                
+                if len(policy) == 0:
+                    return {'Status': 'Policy not found'}
+                
+                if (resource_action == 'Update'):
+                    response = client.update_policy(
+                        PolicyId=policy[0]['Id'],
+                        Content=policy_contents
+                    )
+                    return response, PolicyId
+                
+                response = client.delete_policy(PolicyId=policy[0]['Id'])
+                return response, ""
+                
+      Handler: "index.lambda_handler"
+      Runtime: python3.8
+      Timeout: 60
+      Role: !GetAtt LambdaPermission.Arn
+      
+  LambdaBudgetAction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile:
+         |
+            import boto3
+            import json
+            import os
+            import datetime
+            from dateutil.relativedelta import relativedelta
+
+            NUM_SERVICES_TO_REPORT=5
+
+            #Does the work to determine if any accounts are listed as not having a tax exempt status
+            def lambda_handler(event, context):
+              print(event)
+              message = event['Records'][0]['Sns']['Message']
+              
+              json_message = json.loads(message)
+              alarm_state = json_message['NewStateValue']
+              old_alarm_state = json_message['OldStateValue']
+              
+              #Get the account that triggered this
+              trigger = json_message['Trigger']
+              for item in trigger['Dimensions']:
+                if item['name'] == 'LinkedAccount':
+                  accountId = item['value']
+              
+              if alarm_state == "ALARM": 
+                print('In alarm')
+                
+                #Quarantine the account and show the top services
+                top_services = calculate_top_cost_categories(accountId)
+                quarantine_account(accountId)
+                send_quarantine_notification(accountId, top_services)
+                
+              elif alarm_state == "OK" and old_alarm_state == "ALARM":
+                #This is a clearned alarm, so we need to remove the SCP
+                unquarantine_account(accountId)
+                send_unquarantine_notification(accountId)
+                
+            def unquarantine_account(accountId):
+              policyId = os.environ['POLICY_ID']
+              client = boto3.client('organizations')
+              try: 
+                response = client.detach_policy(PolicyId=policyId, TargetId=accountId)
+              except client.exceptions.PolicyNotAttachedException:
+                print('SCP already detached')
+              except Exception as e:
+                print(e)
+                 
+
+            def send_unquarantine_notification(accountId):
+              message = "Account # {} no longer has a spend above the administrator set threshold, so it has been un-suspended.\n\n".format(accountId)
+                
+              sns = boto3.client('sns')
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              response = sns.publish(TopicArn=sns_topic_arn,
+                                     Subject="AWS Account #{} reactivated".format(accountId),
+                                     Message=message) 
+
+            def quarantine_account(accountId):
+              policyId = os.environ['POLICY_ID']
+              client = boto3.client('organizations')
+              try: 
+                response = client.attach_policy(PolicyId=policyId, TargetId=accountId)
+              except client.exceptions.DuplicatePolicyAttachmentException:
+                print('SCP already attached')
+              except Exception as e:
+                print(e)
+
+            def send_quarantine_notification(accountId, top_services):
+              message = "Account # {} has a spend that is increasing above the administrator set threshold, so it has been suspended.\n\n".format(accountId)
+              message += "Please work with your administrator for the users who are permitted to login to the account to turn off services.\n\n"
+              message += "For your information, the following are the top-costing services in this account:\n\n"
+              
+              service_count = 0
+              for svc in top_services:
+                if service_count <= NUM_SERVICES_TO_REPORT:
+                  message += " - {} : ${:,.2f}\n".format(svc['Service'], float(svc['Usage']))
+                service_count += 1
+                
+              sns = boto3.client('sns')
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              response = sns.publish(TopicArn=sns_topic_arn,
+                                     Subject="AWS Account #{} deactivated".format(accountId),
+                                     Message=message)
+
+            def calculate_top_cost_categories(accountId):
+              today = datetime.date.today()
+              first_day_of_month = today.replace(day=1)
+              next_month = today + relativedelta(months=+1)
+              next_month = next_month.replace(day=1)
+              last_day_of_month = next_month - datetime.timedelta(days=1)
+              
+              print(first_day_of_month)
+              print(last_day_of_month)
+              
+              client = boto3.client('ce')
+              response = client.get_cost_and_usage(
+                  TimePeriod={'Start':first_day_of_month.strftime("%Y-%m-%d"), 'End':last_day_of_month.strftime("%Y-%m-%d")}, 
+                  Granularity='MONTHLY',
+                  Filter={"Dimensions": {"Key":"LINKED_ACCOUNT", "Values":[accountId]}},
+                  Metrics=["UnblendedCost"],
+                  GroupBy=[{"Type":"DIMENSION", "Key":"SERVICE"}]
+                  )
+              
+              services = []
+              for item in response['ResultsByTime'][0]['Groups']:
+                json_item = {"Service": item['Keys'][0], "Usage": item['Metrics']['UnblendedCost']['Amount'] }
+                services.append(json_item)
+              
+              services.sort(reverse=True, key=myFunc)
+              print(services)
+              return services 
+              
+            def myFunc(e):
+              return e['Usage']
+
+
+      Handler: "index.lambda_handler"
+      Environment:
+        Variables:
+          POLICY_ID: !GetAtt SCPPolicy.PolicyId
+          SNS_TOPIC_ARN: !Ref BudgetSNSTopic
+      Runtime: python3.8
+      Timeout: 60
+      Role: !GetAtt LambdaPermission.Arn
+      
+  LambdaPermission:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub 'quarantine-scp-${AWS::Region}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:UpdatePolicy
+                  - organizations:CreatePolicy
+                  - organizations:DeletePolicy
+                  - organizations:ListPolicies
+                  - organizations:AttachPolicy
+                  - organizations:DetachPolicy
+                  - ce:GetCostAndUsage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BudgetSNSTopic
+                
+Outputs:
+  BillingAlarmTopic:
+    Value: !Ref CWAlarmSNSTopic
