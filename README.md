@@ -1,5 +1,5 @@
 # sandbox-cost-control
-This repo sets up infrastructure so you can monitor costs in an AWS child account and turn off all access when a certain budget threshold is crossed. When a child account crosses the budget threshold you set up, a Service Control Policy is applied to the account that performs a `Deny` on `"\*"`. This effectively denies all access to the account. If you have a resource that does not query for permissions (like an already running EC2 instance), it will continue to run. However, anything not already running (like a Lambda function or Step Function) won't be able to execute due to the deny. 
+This repo sets up infrastructure so you can monitor costs in an AWS child account and turn off all access when a certain budget threshold is crossed. When a child account crosses the budget threshold you set up, a Service Control Policy is applied to the account that performs a `Deny` on `"*"`. This effectively denies all access to the account. If you have a resource that does not query for permissions (like an already running EC2 instance), it will continue to run. However, anything not already running (like a Lambda function or Step Function) won't be able to execute due to the deny. 
 
 Once the billing for the account resets (at the beginning of the month), the SCP is removed and the account can be accessed again.
 
