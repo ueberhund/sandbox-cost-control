@@ -1,5 +1,5 @@
 # sandbox-cost-control
-This repo sets up infrastructure so you can monitor costs in an AWS child account and turn off all access when a certain budget threshold is crossed. When a child account crosses the budget threshold you set up, a Service Control Policy is applied to the account that performs a Deny on "\*". This effectively denies all access to the account. If you have a resource that does not query for permissions (like an already running EC2 instance), it will continue to run. However, anything not already running (like a Lambda function or Step Function) won't be able to execute due to the deny. 
+This repo sets up infrastructure so you can monitor costs in an AWS child account and turn off all access when a certain budget threshold is crossed. When a child account crosses the budget threshold you set up, a Service Control Policy is applied to the account that performs a `Deny` on `"\*"`. This effectively denies all access to the account. If you have a resource that does not query for permissions (like an already running EC2 instance), it will continue to run. However, anything not already running (like a Lambda function or Step Function) won't be able to execute due to the deny. 
 
 Once the billing for the account resets (at the beginning of the month), the SCP is removed and the account can be accessed again.
 
@@ -20,11 +20,11 @@ Once you've modified those fields, run the script
 
 ## Using the solution
 
-Once the solution is active, it will monitor your accounts for billing data that goes above the threshold you specify. If an account crosses the biling threshold, you'll receive a message similar to this:
+Once the solution is active, it will monitor your accounts for billing data that goes above the threshold you specify. If an account crosses the billing threshold, you'll receive a message similar to this:
 
 ![deactivated account](/images/account_deactivated.png)
 
-The solution will also apply a SCP called **QuarantineSCP** to the account, which denies all actions in the account except for actions from users identified in the ADMIN_USER_ARN field. This user can login to the account, turn off resources, etc.
+The solution will also apply a SCP called **QuarantineSCP** to the account, which denies all actions in the account except for actions from users identified in the `ADMIN_USER_ARN` field. This user can login to the account, turn off resources, etc.
 
 Once the billing cycle resets (the beginning of the month), the account will be reactivated, and you'll receive a message similar to this:
 
